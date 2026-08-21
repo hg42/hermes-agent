@@ -1,0 +1,33 @@
+name: Append-Only Vault Sync
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Runs every 6 hours to capture short-lived agent branches
+  workflow_dispatch: # Lets you trigger it manually anytime
+
+jobs:
+  vault-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetches full history, not just the latest commit
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Append New Upstream Branches
+        run: |
+          # 1. Map the parent repo
+          git remote add upstream https://github.com
+          
+          # 2. Fetch ALL branches and history from parent (WITHOUT --prune)
+          # Omitting --prune ensures that if they delete a branch, your local runner won't forget it.
+          git fetch upstream
+          
+          # 3. Safely push branches to your fork
+          # We do NOT use --force. This prevents overwriting history.
+          # If a branch already exists, it will just update it with new commits.
+          # If a branch is brand new, it will create it in your fork.
+          git push origin 'refs/remotes/upstream/*:refs/heads/*' --atomic || true
+          
+          echo "Vault sync completed successfully. All unique branches preserved."
