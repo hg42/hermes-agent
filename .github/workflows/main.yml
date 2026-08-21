@@ -18,7 +18,7 @@ jobs:
       - name: Append New Upstream Branches
         run: |
           # 1. Map the parent repo
-          git remote add upstream https://github.com
+          git remote add upstream https://github.com/NousResearch/hermes-agent
           
           # 2. Fetch ALL branches and history from parent (WITHOUT --prune)
           # Omitting --prune ensures that if they delete a branch, your local runner won't forget it.
