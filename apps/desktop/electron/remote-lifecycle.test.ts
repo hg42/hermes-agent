@@ -10,8 +10,10 @@ import { test } from 'vitest'
 import { profileSshOverride } from './connection-config'
 import {
   buildSpawnCommand,
+  classifySshReuseProof,
   cleanupStale,
   connect,
+  disconnect,
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,
@@ -39,6 +41,23 @@ import {
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
+
+test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
+  assert.equal(
+    classifySshReuseProof(
+      { ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1, runtimeIntact: false },
+      SPAWN_NONCE
+    ),
+    'authenticated-stale'
+  )
+})
+
+test('SSH reuse proof remains compatible when runtime state is absent', () => {
+  assert.equal(
+    classifySshReuseProof({ ok: true, sshOwnerNonce: SPAWN_NONCE, protocolVersion: 1 }, SPAWN_NONCE),
+    'authenticated-ok'
+  )
+})
 
 function ownedLock(over: any = {}) {
   return {
@@ -469,6 +488,29 @@ test.skipIf(process.platform === 'win32')(
     }
   }
 )
+
+test('disconnect reaps the backend recorded for this desktop ownership', async () => {
+  const lock = ownedLock()
+
+  const ssh = fakeSsh([
+    [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE\n'],
+    [/print\("OWNED"/, 'OWNED\n']
+  ])
+
+  await disconnect(ssh, OWNERSHIP_ID)
+
+  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
+test('disconnect is a no-op when this desktop has no lockfile', async () => {
+  const ssh = fakeSsh([[/cat .*backend\.lock\.json/, '']])
+
+  await disconnect(ssh, OWNERSHIP_ID)
+
+  assert.ok(!ssh.calls.some(command => /\bkill\b/.test(command)))
+})
 
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {
   const notOurs = fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']])

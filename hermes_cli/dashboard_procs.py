@@ -143,6 +143,31 @@ def _scan_dashboard_processes(
         dashboard_processes = [
             proc for proc in dashboard_processes if proc[0] not in exclude_pids
         ]
+
+    # Spawn-ledger augmentation (#63206/#81564): the substring patterns above
+    # miss profiled launches — `hermes --profile p serve --host <ip>` contains
+    # neither "hermes serve" nor "hermes_cli.main serve". Every serve/
+    # dashboard registers itself in the machine spawn ledger at startup with
+    # live-verified (pid, create_time), so ledger rows are positive identity,
+    # not argv guessing. Add any live ledger serve/dashboard the scan missed;
+    # prefer the ledger's recorded argv (full launch args) over the scan's
+    # truncated view.
+    try:
+        from hermes_cli.process_identity import ledger_entries
+
+        seen = {pid for pid, _ in dashboard_processes}
+        for entry in ledger_entries():
+            if entry.get("purpose") not in ("serve", "dashboard"):
+                continue
+            pid = entry.get("pid")
+            if not isinstance(pid, int) or pid == self_pid or pid in seen:
+                continue
+            if exclude_pids and pid in exclude_pids:
+                continue
+            dashboard_processes.append((pid, str(entry.get("argv") or "")))
+    except Exception:
+        pass  # ledger unavailable → scan-only behavior, exactly as before
+
     return dashboard_processes
 
 
@@ -838,6 +863,20 @@ def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     return owned
 
 
+# Grace window before an orphaned-looking backend may be reaped. Covers the
+# gap between process start and the Desktop client writing backend.lock.json.
+_REAP_MIN_AGE_SECONDS = 180.0
+
+
+def _process_age_seconds(pid: int) -> float:
+    """Return a process age using psutil's cross-platform start timestamp."""
+    import time as _time
+
+    import psutil as _psutil
+
+    return max(0.0, _time.time() - _psutil.Process(pid).create_time())
+
+
 def _reap_orphaned_desktop_local_serves(
     *,
     reason: str = "orphaned desktop-local hermes serve",
@@ -845,6 +884,7 @@ def _reap_orphaned_desktop_local_serves(
     signal_kill=None,
     sleep_fn=None,
     lock_owned_pids_fn=None,
+    process_age_seconds_fn=None,
 ) -> dict[str, list]:
     """Kill leftover Desktop-local ``hermes serve`` backends with no parent.
 
@@ -867,6 +907,13 @@ def _reap_orphaned_desktop_local_serves(
       by another client/machine* which legitimately sit at ppid 1 after sshd
       exits. Killing those is a production incident, not cleanup.
     - never fixed-port remote serves (e.g. ``--port 9119``)
+    - never a candidate younger than ``_REAP_MIN_AGE_SECONDS`` (or whose age
+      cannot be determined). The Desktop client writes ``backend.lock.json``
+      only after the backend reports HERMES_BACKEND_READY, so during
+      concurrent multi-profile startup a live sibling is briefly unowned and
+      otherwise indistinguishable from a corpse; sparing young processes
+      closes that mutual-reap window. A genuine corpse merely waits for a
+      later scan.
     - best-effort; failures never raise to the caller
     """
     import signal as _signal
@@ -880,6 +927,8 @@ def _reap_orphaned_desktop_local_serves(
         sleep_fn = _time.sleep
     if lock_owned_pids_fn is None:
         lock_owned_pids_fn = _lock_owned_serve_pids
+    if process_age_seconds_fn is None:
+        process_age_seconds_fn = _process_age_seconds
 
     if sys.platform == "win32":
         # Windows desktop uses taskkill tree teardown; orphan scan here is POSIX.
@@ -925,6 +974,21 @@ def _reap_orphaned_desktop_local_serves(
             continue
         # Orphaned under init/launchd.
         if ppid not in (0, 1):
+            continue
+        # Spare backends that are still starting up. backend.lock.json is
+        # written by the *Desktop client* only after the backend reports
+        # HERMES_BACKEND_READY, so a sibling spawned seconds ago is not yet
+        # lock-owned and is invisible to the owned_now guard above. When
+        # Desktop opens several profiles at once (each its own SSH spawn),
+        # every new backend reaped its concurrently-starting siblings, whose
+        # clients then reconnected and reaped the next batch -- a mutual-reap
+        # storm. A genuine corpse from a previous Desktop session is always
+        # older than this grace window; anything younger is a live sibling.
+        try:
+            if process_age_seconds_fn(pid) < _REAP_MIN_AGE_SECONDS:
+                continue
+        except Exception:
+            # Never let a liveness probe failure widen the reap.
             continue
         targets.append((pid, cmd))
 

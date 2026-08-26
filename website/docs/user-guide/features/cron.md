@@ -334,18 +334,48 @@ ledger is included in quick backups.
 
 ### Repeated-failure review nudge
 
-Each job tracks a `failure_streak` — consecutive runs where the agent failed
-(delivery failures don't count). When a *recurring* job's streak reaches the
-threshold, the failure message delivered to chat gains a review nudge telling
-you the job has failed N runs in a row and suggesting you fix, pause
-(`hermes cron pause <job>`), or remove it. Any successful run resets the
-streak, and `hermes cron list` shows the streak alongside a failing job's last
-run. One-shot jobs never nudge.
+Each job tracks a `failure_streak` — consecutive failed runs (delivery
+failures don't count). A run that fails before the agent is reached at all —
+a bad import after a half-applied update, a provider client that cannot be
+constructed — counts and alerts the same as one the agent itself failed. When
+a *recurring* job's streak reaches the threshold, the failure message
+delivered to chat gains a review nudge telling you the job has failed N runs
+in a row and suggesting you fix, pause (`hermes cron pause <job>`), or remove
+it. Any successful run resets the streak, and `hermes cron list` shows the
+streak alongside a failing job's last run. One-shot jobs never nudge.
 
 ```yaml
 cron:
   failure_nudge_threshold: 3   # default; 0 disables the nudge
 ```
+
+### Failure incidents: acknowledge a known failure
+
+A recurring job that keeps failing with the *same* error pings you on every
+run. Each failure is also recorded as a durable **incident**, keyed by the
+job plus a normalized signature of the error text, in the same per-profile
+ledger database as the execution history.
+
+```bash
+hermes cron incidents                 # list incidents (newest activity first)
+hermes cron incidents --state alerted # filter: detected | alerted | closed
+hermes cron incidents ack <id>        # acknowledge — stop re-pinging
+```
+
+Acknowledging an incident silences the per-run failure ping for that exact
+signature only. Nothing else changes: the run history still records every
+failure, the failure streak keeps counting, and the moment the job starts
+failing with a *different* error a new incident is minted and alerts fire
+again. A successful run doesn't touch incidents — they are per-signature, not
+per-job.
+
+Incident lifecycle: `detected` (failure recorded) → `alerted` (at least one
+failure ping reached delivery) → `closed` (acknowledged; terminal for that
+signature). Stored error text is secret-redacted and truncated before it is
+written.
+
+Recording is always on and costs nothing to ignore — no ping is ever
+suppressed until you explicitly `ack`.
 
 ## Delivery options
 
@@ -448,7 +478,7 @@ cron:
   mirror_delivery: false   # set true to make cron deliveries continuable
 ```
 
-Behaviour is **thread-preferred**, scoped to the job's origin chat:
+Behaviour is **thread-preferred**, scoped to the job's own conversation:
 
 - **Thread-capable platforms** (Telegram topics, Discord/Slack threads): each
   delivery opens its own dedicated thread and the brief is seeded into that
@@ -459,8 +489,19 @@ Behaviour is **thread-preferred**, scoped to the job's origin chat:
   is mirrored into the origin DM session instead — the DM itself is the
   continuation surface.
 
-Only the origin chat is ever touched: fan-out / broadcast targets (`all`,
-explicit other-chat deliveries) are never made continuable. The mirror is
+Only the job's **own conversation** is ever touched:
+
+- the **origin chat** the job was created in;
+- the **home-channel fallback** when `deliver: origin` captured no origin (jobs
+  created by scripts or the API rather than from a live gateway chat) — the
+  user's primary conversation standing in for the origin;
+- a job's **single explicit `platform:chat` target**, but only when the job
+  itself opts in with `attach_to_session: true` — the job author declares that
+  target a conversation. The global `mirror_delivery` flag alone never makes an
+  explicitly-addressed chat continuable.
+
+Broadcast / fan-out targets (`all`, bare-platform home channels) are never made
+continuable. The mirror is
 written as a labelled user turn (`[Cron delivery: <task name>]`), which keeps
 the conversation history alternation-safe across all model providers.
 
